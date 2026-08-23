@@ -20,6 +20,7 @@ package scheduler
 
 import (
 	"reflect"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -42,6 +43,7 @@ type Scheduler struct {
 	stop               chan struct{}    // channel to signal stop request
 	healthChecker      *HealthChecker
 	nodesMonitor       *nodesResourceUsageMonitor
+	wg                 sync.WaitGroup
 }
 
 func NewScheduler() *Scheduler {
@@ -66,9 +68,9 @@ func (s *Scheduler) StartService(handlers handler.EventHandlers, manualSchedule 
 	s.clusterContext.setEventHandler(handlers.RMProxyEventHandler)
 
 	// Start event handlers
-	go s.handleAllocEvent()
-	go s.handleInfraEvent()
-	go s.handleNodeEvent()
+	s.startGoroutine(s.handleAllocEvent)
+	s.startGoroutine(s.handleInfraEvent)
+	s.startGoroutine(s.handleNodeEvent)
 
 	// Start resource monitor if necessary (majorly for testing)
 	s.nodesMonitor = newNodesResourceUsageMonitor(s.clusterContext)
@@ -79,10 +81,18 @@ func (s *Scheduler) StartService(handlers handler.EventHandlers, manualSchedule 
 	s.healthChecker.Start()
 
 	if !manualSchedule {
-		go s.internalSchedule()
-		go s.internalInspectOutstandingRequests()
-		go s.internalQuotaPreemption()
+		s.startGoroutine(s.internalSchedule)
+		s.startGoroutine(s.internalInspectOutstandingRequests)
+		s.startGoroutine(s.internalQuotaPreemption)
 	}
+}
+
+func (s *Scheduler) startGoroutine(fn func()) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		fn()
+	}()
 }
 
 // Internal start scheduling service
@@ -156,6 +166,11 @@ func enqueueAndCheckFull(queue chan interface{}, ev interface{}) {
 
 func (s *Scheduler) handleAllocEvent() {
 	for {
+		select {
+		case <-s.stop:
+			return
+		default:
+		}
 		select {
 		case ev := <-s.pendingAllocEvents:
 			switch v := ev.(type) {
@@ -299,4 +314,5 @@ func (s *Scheduler) Stop() {
 	s.nodesMonitor.stop()
 	s.clusterContext.Stop()
 	close(s.stop)
+	s.wg.Wait()
 }
